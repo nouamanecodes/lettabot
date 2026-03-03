@@ -181,7 +181,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
 
   // Event handlers (set by bot core)
   onMessage?: (msg: InboundMessage) => Promise<void>;
-  onCommand?: (command: string) => Promise<string | null>;
+  onCommand?: (command: string, chatId?: string, args?: string) => Promise<string | null>;
 
   // Pre-bound handlers (created once to avoid bind() overhead)
   private boundHandleConnectionUpdate: (update: Partial<import("@whiskeysockets/baileys").ConnectionState>) => void;
@@ -809,12 +809,12 @@ export class WhatsAppAdapter implements ChannelAdapter {
       }
 
       // Handle slash commands (before debouncing)
-      const command = parseCommand(body);
-      if (command && !isHistory) {
-        if (command === 'help' || command === 'start') {
+      const parsed = parseCommand(body);
+      if (parsed && !isHistory) {
+        if (parsed.command === 'help' || parsed.command === 'start') {
           await this.sendMessage({ chatId, text: HELP_TEXT });
         } else if (this.onCommand) {
-          const result = await this.onCommand(command);
+          const result = await this.onCommand(parsed.command, chatId, parsed.args || undefined);
           if (result) await this.sendMessage({ chatId, text: result });
         }
         return; // Don't pass commands to agent
@@ -836,6 +836,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
           isListeningMode,
           replyToUser: extracted.replyContext?.senderE164,
           attachments: extracted.attachments,
+          formatterHints: this.getFormatterHints(),
         });
       }
     }
@@ -1000,6 +1001,14 @@ export class WhatsAppAdapter implements ChannelAdapter {
 
   getDmPolicy(): string {
     return this.config.dmPolicy || 'pairing';
+  }
+
+  getFormatterHints() {
+    return {
+      supportsReactions: false,
+      supportsFiles: true,
+      formatHint: 'WhatsApp: *bold* _italic_ `code` — NO: headers, code fences, links, tables',
+    };
   }
 
   supportsEditing(): boolean {

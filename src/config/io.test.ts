@@ -458,11 +458,14 @@ describe('loadConfig with fleet config', () => {
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'lettabot-fleet-test-'));
     originalEnv = process.env.LETTABOT_CONFIG;
+    delete process.env.LETTABOT_CONFIG_YAML;
     setLoadedFromFleetConfig(false);
   });
 
   afterEach(() => {
     process.env.LETTABOT_CONFIG = originalEnv;
+    delete process.env.LETTABOT_CONFIG_YAML;
+    setLoadedFromFleetConfig(false);
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -505,6 +508,15 @@ describe('loadConfig with fleet config', () => {
     expect((config as any).system_prompt).toBeUndefined();
   });
 
+  it('should reset wasLoadedFromFleetConfig to false when config file is missing', () => {
+    process.env.LETTABOT_CONFIG = join(tmpDir, 'missing.yaml');
+    setLoadedFromFleetConfig(true);
+
+    loadConfig();
+
+    expect(wasLoadedFromFleetConfig()).toBe(false);
+  });
+
   it('should set wasLoadedFromFleetConfig to false for native config', () => {
     const configPath = join(tmpDir, 'lettabot.yaml');
     writeFileSync(
@@ -520,7 +532,7 @@ describe('loadConfig with fleet config', () => {
   });
 
   it('lettabot.yaml should take priority over agents.yml', () => {
-    // Write both files
+    // Write both files in an isolated cwd and rely on resolveConfigPath() scanning.
     const nativePath = join(tmpDir, 'lettabot.yaml');
     writeFileSync(
       nativePath,
@@ -532,9 +544,8 @@ describe('loadConfig with fleet config', () => {
       'utf-8',
     );
 
-    const fleetPath = join(tmpDir, 'agents.yml');
     writeFileSync(
-      fleetPath,
+      join(tmpDir, 'agents.yml'),
       YAML.stringify({
         agents: [{
           name: 'FleetLoses',
@@ -546,15 +557,44 @@ describe('loadConfig with fleet config', () => {
       'utf-8',
     );
 
-    // Point LETTABOT_CONFIG at the native file (simulates priority)
-    process.env.LETTABOT_CONFIG = nativePath;
+    const originalCwd = process.cwd();
+    delete process.env.LETTABOT_CONFIG;
+    delete process.env.LETTABOT_CONFIG_YAML;
+    process.chdir(tmpDir);
+
+    try {
+      const config = loadConfig();
+      expect(config.agent.name).toBe('NativeWins');
+      expect(wasLoadedFromFleetConfig()).toBe(false);
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
+  it('should not treat agents.yml without lettabot section as fleet config', () => {
+    const configPath = join(tmpDir, 'agents.yml');
+    writeFileSync(
+      configPath,
+      YAML.stringify({
+        agents: [
+          {
+            name: 'ServerOnly',
+            llm_config: { model: 'gpt-4' },
+            system_prompt: { value: 'hi' },
+          },
+        ],
+      }),
+      'utf-8',
+    );
+    process.env.LETTABOT_CONFIG = configPath;
 
     const config = loadConfig();
-    expect(config.agent.name).toBe('NativeWins');
+
+    expect(config.agent.name).toBe(DEFAULT_CONFIG.agent.name);
     expect(wasLoadedFromFleetConfig()).toBe(false);
   });
 
-  it('should throw via loadConfigStrict when fleet config has no lettabot sections', () => {
+  it('should not throw via loadConfigStrict when agents.yml has no lettabot sections', () => {
     const configPath = join(tmpDir, 'agents.yml');
     writeFileSync(
       configPath,
@@ -567,7 +607,41 @@ describe('loadConfig with fleet config', () => {
     );
     process.env.LETTABOT_CONFIG = configPath;
 
-    expect(() => loadConfigStrict()).toThrow(/No agents in fleet config have a `lettabot:` section/);
+    const config = loadConfigStrict();
+    expect(config.agent.name).toBe(DEFAULT_CONFIG.agent.name);
+    expect(wasLoadedFromFleetConfig()).toBe(false);
+  });
+
+  it('should preserve large discord group IDs from fleet config', () => {
+    const configPath = join(tmpDir, 'agents.yml');
+    writeFileSync(
+      configPath,
+      [
+        'agents:',
+        '  - name: SnowflakeBot',
+        '    llm_config:',
+        '      model: gpt-4',
+        '    system_prompt:',
+        '      value: hi',
+        '    lettabot:',
+        '      channels:',
+        '        discord:',
+        '          enabled: true',
+        '          token: test-token',
+        '          instantGroups:',
+        '            - 123456789012345678',
+        '          groups:',
+        '            123456789012345678:',
+        '              mode: listen',
+      ].join('\n'),
+      'utf-8',
+    );
+    process.env.LETTABOT_CONFIG = configPath;
+
+    const config = loadConfig();
+
+    expect(config.channels.discord?.instantGroups?.[0]).toBe('123456789012345678');
+    expect(config.channels.discord?.groups?.['123456789012345678']).toEqual({ mode: 'listen' });
   });
 
   it('should handle multi-agent fleet config', () => {

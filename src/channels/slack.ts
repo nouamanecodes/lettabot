@@ -24,6 +24,7 @@ export interface SlackConfig {
   appToken: string;       // xapp-... (for Socket Mode)
   dmPolicy?: 'pairing' | 'allowlist' | 'open';
   allowedUsers?: string[]; // Slack user IDs (e.g., U01234567)
+  streaming?: boolean;    // Stream responses via progressive message edits (default: false)
   attachmentsDir?: string;
   attachmentsMaxBytes?: number;
   groups?: Record<string, GroupModeConfig>;  // Per-channel settings
@@ -40,7 +41,7 @@ export class SlackAdapter implements ChannelAdapter {
   private attachmentsMaxBytes?: number;
   
   onMessage?: (msg: InboundMessage) => Promise<void>;
-  onCommand?: (command: string) => Promise<string | null>;
+  onCommand?: (command: string, chatId?: string, args?: string) => Promise<string | null>;
   
   constructor(config: SlackConfig) {
     this.config = config;
@@ -114,12 +115,12 @@ export class SlackAdapter implements ChannelAdapter {
       }
       
       // Handle slash commands
-      const command = parseCommand(text);
-      if (command) {
-        if (command === 'help' || command === 'start') {
+      const parsed = parseCommand(text);
+      if (parsed) {
+        if (parsed.command === 'help' || parsed.command === 'start') {
           await say(await markdownToSlackMrkdwn(HELP_TEXT));
         } else if (this.onCommand) {
-          const result = await this.onCommand(command);
+          const result = await this.onCommand(parsed.command, channelId, parsed.args || undefined);
           if (result) await say(await markdownToSlackMrkdwn(result));
         }
         return; // Don't pass commands to agent
@@ -168,6 +169,7 @@ export class SlackAdapter implements ChannelAdapter {
           wasMentioned: false, // Regular messages; app_mention handles mentions
           isListeningMode: mode === 'listen',
           attachments,
+          formatterHints: this.getFormatterHints(),
         });
       }
     });
@@ -200,14 +202,14 @@ export class SlackAdapter implements ChannelAdapter {
           const result = await transcribeAudio(buffer, audioFile.name || `audio.${ext}`);
 
           if (result.success && result.text) {
-            console.log(`[Slack] Transcribed audio: "${result.text.slice(0, 50)}..."`);
+            log.info(`Transcribed audio: "${result.text.slice(0, 50)}..."`);
             text = (text ? text + '\n' : '') + `[Voice message]: ${result.text}`;
           } else {
-            console.error(`[Slack] Transcription failed: ${result.error}`);
+            log.error(`Transcription failed: ${result.error}`);
             text = (text ? text + '\n' : '') + `[Voice message - transcription failed: ${result.error}]`;
           }
         } catch (error) {
-          console.error('[Slack] Error transcribing audio:', error);
+          log.error('Error transcribing audio:', error);
           text = (text ? text + '\n' : '') + `[Voice message - error: ${error instanceof Error ? error.message : 'unknown error'}]`;
         }
       }
@@ -231,12 +233,12 @@ export class SlackAdapter implements ChannelAdapter {
       }
       
       // Handle slash commands
-      const command = parseCommand(text);
-      if (command) {
-        if (command === 'help' || command === 'start') {
+      const parsed = parseCommand(text);
+      if (parsed) {
+        if (parsed.command === 'help' || parsed.command === 'start') {
           await this.sendMessage({ chatId: channelId, text: HELP_TEXT, threadId: threadTs });
         } else if (this.onCommand) {
-          const result = await this.onCommand(command);
+          const result = await this.onCommand(parsed.command, channelId, parsed.args || undefined);
           if (result) await this.sendMessage({ chatId: channelId, text: result, threadId: threadTs });
         }
         return; // Don't pass commands to agent
@@ -263,6 +265,7 @@ export class SlackAdapter implements ChannelAdapter {
           groupName: isGroup ? channelId : undefined,
           wasMentioned: true, // app_mention is always a mention
           attachments,
+          formatterHints: this.getFormatterHints(),
         });
       }
     });
@@ -326,6 +329,10 @@ export class SlackAdapter implements ChannelAdapter {
     return { messageId: ts };
   }
   
+  supportsEditing(): boolean {
+    return this.config.streaming ?? false;
+  }
+
   async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
     if (!this.app) throw new Error('Slack not started');
 
@@ -352,6 +359,14 @@ export class SlackAdapter implements ChannelAdapter {
   
   getDmPolicy(): string {
     return this.config.dmPolicy || 'pairing';
+  }
+
+  getFormatterHints() {
+    return {
+      supportsReactions: true,
+      supportsFiles: true,
+      formatHint: 'Slack mrkdwn: *bold* _italic_ `code` <URL|text> — NO standard markdown headers',
+    };
   }
 
   /** Check if a channel is allowed by the groups config allowlist */
@@ -408,6 +423,7 @@ export class SlackAdapter implements ChannelAdapter {
         messageId,
         action,
       },
+      formatterHints: this.getFormatterHints(),
     });
   }
 

@@ -11,7 +11,32 @@ vi.mock('@letta-ai/letta-code-sdk', () => ({
   imageFromURL: vi.fn(),
 }));
 
-import { createSession, resumeSession } from '@letta-ai/letta-code-sdk';
+vi.mock('../tools/letta-api.js', () => ({
+  updateAgentName: vi.fn().mockResolvedValue(undefined),
+  getPendingApprovals: vi.fn(),
+  rejectApproval: vi.fn(),
+  cancelRuns: vi.fn(),
+  recoverOrphanedConversationApproval: vi.fn(),
+  getLatestRunError: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock('../skills/loader.js', () => ({
+  installSkillsToAgent: vi.fn(),
+  prependSkillDirsToPath: vi.fn(),
+  getAgentSkillExecutableDirs: vi.fn().mockReturnValue([]),
+  isVoiceMemoConfigured: vi.fn().mockReturnValue(false),
+}));
+
+vi.mock('./memory.js', () => ({
+  loadMemoryBlocks: vi.fn().mockReturnValue([]),
+}));
+
+vi.mock('./system-prompt.js', () => ({
+  SYSTEM_PROMPT: 'test system prompt',
+}));
+
+import { createAgent, createSession, resumeSession } from '@letta-ai/letta-code-sdk';
+import { getLatestRunError } from '../tools/letta-api.js';
 import { LettaBot } from './bot.js';
 
 function deferred<T>() {
@@ -77,7 +102,6 @@ describe('SDK session contract', () => {
       conversationId: 'conversation-contract-test',
     };
 
-    vi.mocked(createSession).mockReturnValue(mockSession as never);
     vi.mocked(resumeSession).mockReturnValue(mockSession as never);
 
     const bot = new LettaBot({
@@ -88,13 +112,49 @@ describe('SDK session contract', () => {
     await bot.sendToAgent('first message');
     await bot.sendToAgent('second message');
 
-    expect(vi.mocked(resumeSession)).not.toHaveBeenCalled();
-    expect(vi.mocked(createSession)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(createSession)).not.toHaveBeenCalled();
+    expect(vi.mocked(resumeSession)).toHaveBeenCalledTimes(1);
     expect(mockSession.initialize).toHaveBeenCalledTimes(1);
     expect(mockSession.send).toHaveBeenCalledTimes(2);
     expect(mockSession.send).toHaveBeenNthCalledWith(1, 'first message');
     expect(mockSession.send).toHaveBeenNthCalledWith(2, 'second message');
     expect(mockSession.stream).toHaveBeenCalledTimes(2);
+  });
+
+  it('accumulates tool_call arguments when continuation chunks omit toolCallId', async () => {
+    const mockSession = {
+      initialize: vi.fn(async () => undefined),
+      send: vi.fn(async (_message: unknown) => undefined),
+      stream: vi.fn(() =>
+        (async function* () {
+          yield { type: 'tool_call', toolCallId: 'tc-1', toolName: 'Bash', rawArguments: '{"command":"ec' };
+          yield { type: 'tool_call', toolName: 'Bash', rawArguments: 'ho hi"}' };
+          yield { type: 'assistant', content: 'done' };
+          yield { type: 'result', success: true };
+        })()
+      ),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-contract-test',
+      conversationId: 'conversation-contract-test',
+    };
+
+    vi.mocked(createSession).mockReturnValue(mockSession as never);
+    vi.mocked(resumeSession).mockReturnValue(mockSession as never);
+
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+    });
+
+    const chunks: Array<Record<string, unknown>> = [];
+    for await (const msg of bot.streamToAgent('test')) {
+      chunks.push(msg as Record<string, unknown>);
+    }
+
+    const toolCalls = chunks.filter((m) => m.type === 'tool_call');
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0].toolCallId).toBe('tc-1');
+    expect(toolCalls[0].toolInput).toEqual({ command: 'echo hi' });
   });
 
   it('closes session if initialize times out before first send', async () => {
@@ -123,6 +183,95 @@ describe('SDK session contract', () => {
 
     await expect(bot.sendToAgent('will timeout')).rejects.toThrow('Session initialize (key=shared) timed out after 5ms');
     expect(mockSession.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('recreates agent after explicit agent-not-found initialize error', async () => {
+    delete process.env.LETTA_AGENT_ID;
+
+    const staleSession = {
+      initialize: vi.fn(async () => {
+        throw new Error('No init message received from subprocess. stderr: {"detail":"Agent agent-contract-test not found"}');
+      }),
+      send: vi.fn(async (_message: unknown) => undefined),
+      stream: vi.fn(() =>
+        (async function* () {
+          yield { type: 'result', success: true };
+        })()
+      ),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-contract-test',
+      conversationId: 'conv-stale',
+    };
+
+    const recoveredSession = {
+      initialize: vi.fn(async () => undefined),
+      send: vi.fn(async (_message: unknown) => undefined),
+      stream: vi.fn(() =>
+        (async function* () {
+          yield { type: 'assistant', content: 'fresh response' };
+          yield { type: 'result', success: true };
+        })()
+      ),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-recreated',
+      conversationId: 'conv-recreated',
+    };
+
+    vi.mocked(createAgent).mockResolvedValue('agent-recreated');
+    // First call: agentId exists, no convId → resumeSession(agentId)
+    vi.mocked(resumeSession).mockReturnValueOnce(staleSession as never);
+    // After clearAgent + createAgent → createSession(newAgentId)
+    vi.mocked(createSession).mockReturnValueOnce(recoveredSession as never);
+
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+      agentName: 'ContractBot',
+    });
+    bot.setAgentId('agent-contract-test');
+
+    const response = await bot.sendToAgent('recover me');
+    expect(response).toBe('fresh response');
+    expect(staleSession.close).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(createAgent)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(resumeSession).mock.calls[0][0]).toBe('agent-contract-test');
+    expect(vi.mocked(createSession).mock.calls[0][0]).toBe('agent-recreated');
+  });
+
+  it('does not clear agent state on generic initialize failures', async () => {
+    const initFailure = new Error('No init message received from subprocess');
+    const failingSession = {
+      initialize: vi.fn(async () => {
+        throw initFailure;
+      }),
+      send: vi.fn(async (_message: unknown) => undefined),
+      stream: vi.fn(() =>
+        (async function* () {
+          yield { type: 'result', success: true };
+        })()
+      ),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-contract-test',
+      conversationId: 'conv-keep',
+    };
+
+    vi.mocked(resumeSession).mockReturnValue(failingSession as never);
+
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+    });
+    bot.setAgentId('agent-contract-test');
+    const botInternal = bot as unknown as { store: { conversationId: string | null } };
+    botInternal.store.conversationId = 'conv-keep';
+
+    await expect(bot.sendToAgent('should fail')).rejects.toThrow('No init message received from subprocess');
+    expect(failingSession.close).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(createAgent)).not.toHaveBeenCalled();
+    expect(vi.mocked(createSession)).not.toHaveBeenCalled();
+    expect(vi.mocked(resumeSession)).toHaveBeenCalledTimes(1);
+    expect(bot.getStatus().agentId).toBe('agent-contract-test');
+    expect(bot.getStatus().conversationId).toBe('conv-keep');
   });
 
   it('invalidates retry session when fallback send fails after conversation-missing error', async () => {
@@ -159,10 +308,9 @@ describe('SDK session contract', () => {
       conversationId: 'conversation-contract-test-2',
     };
 
-    vi.mocked(createSession)
+    vi.mocked(resumeSession)
       .mockReturnValueOnce(firstSession as never)
       .mockReturnValueOnce(secondSession as never);
-    vi.mocked(resumeSession).mockReturnValue(firstSession as never);
 
     const bot = new LettaBot({
       workingDir: join(dataDir, 'working'),
@@ -172,7 +320,7 @@ describe('SDK session contract', () => {
     await expect(bot.sendToAgent('trigger fallback')).rejects.toThrow('network down');
     expect(firstSession.close).toHaveBeenCalledTimes(1);
     expect(secondSession.close).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(createSession)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(resumeSession)).toHaveBeenCalledTimes(2);
   });
 
   it('reset ignores stale in-flight warm session and creates a fresh one', async () => {
@@ -206,8 +354,9 @@ describe('SDK session contract', () => {
       conversationId: 'conv-new',
     };
 
-    vi.mocked(resumeSession).mockReturnValue(warmSession as never);
-    vi.mocked(createSession).mockReturnValue(resetSession as never);
+    vi.mocked(resumeSession)
+      .mockReturnValueOnce(warmSession as never)
+      .mockReturnValueOnce(resetSession as never);
 
     const bot = new LettaBot({
       workingDir: join(dataDir, 'working'),
@@ -234,10 +383,24 @@ describe('SDK session contract', () => {
     expect(resetMessage).toContain('New conversation: conv-new');
     expect(warmSession.close).toHaveBeenCalledTimes(1);
     expect(resetSession.initialize).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(createSession)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(resumeSession)).toHaveBeenCalledTimes(2);
   });
 
-  it('passes memfs: true to createSession when config sets memfs true', async () => {
+  it('does not pre-warm a shared session in per-chat mode', async () => {
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+      conversationMode: 'per-chat',
+    });
+    bot.setAgentId('agent-contract-test');
+
+    await bot.warmSession();
+
+    expect(vi.mocked(createSession)).not.toHaveBeenCalled();
+    expect(vi.mocked(resumeSession)).not.toHaveBeenCalled();
+  });
+
+  it('passes memfs: true to resumeSession when config sets memfs true', async () => {
     const mockSession = {
       initialize: vi.fn(async () => undefined),
       send: vi.fn(async (_message: unknown) => undefined),
@@ -252,7 +415,7 @@ describe('SDK session contract', () => {
       conversationId: 'conversation-contract-test',
     };
 
-    vi.mocked(createSession).mockReturnValue(mockSession as never);
+    vi.mocked(resumeSession).mockReturnValue(mockSession as never);
 
     const bot = new LettaBot({
       workingDir: join(dataDir, 'working'),
@@ -262,11 +425,11 @@ describe('SDK session contract', () => {
 
     await bot.sendToAgent('test');
 
-    const opts = vi.mocked(createSession).mock.calls[0][1];
+    const opts = vi.mocked(resumeSession).mock.calls[0][1];
     expect(opts).toHaveProperty('memfs', true);
   });
 
-  it('passes memfs: false to createSession when config sets memfs false', async () => {
+  it('passes memfs: false to resumeSession when config sets memfs false', async () => {
     const mockSession = {
       initialize: vi.fn(async () => undefined),
       send: vi.fn(async (_message: unknown) => undefined),
@@ -281,7 +444,7 @@ describe('SDK session contract', () => {
       conversationId: 'conversation-contract-test',
     };
 
-    vi.mocked(createSession).mockReturnValue(mockSession as never);
+    vi.mocked(resumeSession).mockReturnValue(mockSession as never);
 
     const bot = new LettaBot({
       workingDir: join(dataDir, 'working'),
@@ -291,11 +454,11 @@ describe('SDK session contract', () => {
 
     await bot.sendToAgent('test');
 
-    const opts = vi.mocked(createSession).mock.calls[0][1];
+    const opts = vi.mocked(resumeSession).mock.calls[0][1];
     expect(opts).toHaveProperty('memfs', false);
   });
 
-  it('omits memfs key from createSession options when config memfs is undefined', async () => {
+  it('omits memfs key from resumeSession options when config memfs is undefined', async () => {
     const mockSession = {
       initialize: vi.fn(async () => undefined),
       send: vi.fn(async (_message: unknown) => undefined),
@@ -310,7 +473,7 @@ describe('SDK session contract', () => {
       conversationId: 'conversation-contract-test',
     };
 
-    vi.mocked(createSession).mockReturnValue(mockSession as never);
+    vi.mocked(resumeSession).mockReturnValue(mockSession as never);
 
     const bot = new LettaBot({
       workingDir: join(dataDir, 'working'),
@@ -320,7 +483,7 @@ describe('SDK session contract', () => {
 
     await bot.sendToAgent('test');
 
-    const opts = vi.mocked(createSession).mock.calls[0][1];
+    const opts = vi.mocked(resumeSession).mock.calls[0][1];
     expect(opts).not.toHaveProperty('memfs');
   });
 
@@ -351,5 +514,321 @@ describe('SDK session contract', () => {
 
     expect(botInternal.processingKeys.has('slack')).toBe(false);
     expect(processSpy).toHaveBeenCalledWith('slack');
+  });
+
+  it('LRU eviction in per-chat mode does not close active keys', async () => {
+    const createdSession = {
+      initialize: vi.fn(async () => undefined),
+      send: vi.fn(async (_message: unknown) => undefined),
+      stream: vi.fn(() =>
+        (async function* () {
+          yield { type: 'result', success: true };
+        })()
+      ),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-contract-test',
+      conversationId: 'conv-new',
+    };
+    vi.mocked(resumeSession).mockReturnValue(createdSession as never);
+
+    const activeSession = {
+      close: vi.fn(() => undefined),
+    };
+    const idleSession = {
+      close: vi.fn(() => undefined),
+    };
+
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+      conversationMode: 'per-chat',
+      maxSessions: 2,
+    });
+    bot.setAgentId('agent-contract-test');
+
+    const botInternal = bot as any;
+    const sm = botInternal.sessionManager;
+    sm.sessions.set('telegram:active', activeSession);
+    sm.sessions.set('telegram:idle', idleSession);
+    sm.sessionLastUsed.set('telegram:active', 1);
+    sm.sessionLastUsed.set('telegram:idle', 2);
+    botInternal.processingKeys.add('telegram:active');
+
+    await sm._createSessionForKey('telegram:new', true, 0);
+
+    expect(activeSession.close).not.toHaveBeenCalled();
+    expect(idleSession.close).toHaveBeenCalledTimes(1);
+    expect(sm.sessions.has('telegram:active')).toBe(true);
+    expect(sm.sessions.has('telegram:idle')).toBe(false);
+    expect(sm.sessions.has('telegram:new')).toBe(true);
+  });
+
+  it('enriches opaque error via stream error event in sendToAgent', async () => {
+    const mockSession = {
+      initialize: vi.fn(async () => undefined),
+      send: vi.fn(async (_message: unknown) => undefined),
+      stream: vi.fn(() =>
+        (async function* () {
+          yield { type: 'error', message: 'Bad request to Anthropic: context too long', stopReason: 'llm_api_error' };
+          yield { type: 'result', success: false, error: 'error' };
+        })()
+      ),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-contract-test',
+      conversationId: 'conversation-contract-test',
+    };
+
+    vi.mocked(resumeSession).mockReturnValue(mockSession as never);
+
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+    });
+
+    await expect(bot.sendToAgent('trigger error')).rejects.toThrow(
+      'Bad request to Anthropic: context too long'
+    );
+  });
+
+  it('enriches error from run metadata when stream error is opaque', async () => {
+    const mockSession = {
+      initialize: vi.fn(async () => undefined),
+      send: vi.fn(async (_message: unknown) => undefined),
+      stream: vi.fn(() =>
+        (async function* () {
+          yield { type: 'result', success: false, error: 'error', conversationId: 'conv-123' };
+        })()
+      ),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-contract-test',
+      conversationId: 'conv-123',
+    };
+
+    vi.mocked(resumeSession).mockReturnValue(mockSession as never);
+    vi.mocked(getLatestRunError).mockResolvedValueOnce({
+      message: 'INTERNAL_SERVER_ERROR: Bad request to Anthropic: Error code: 400',
+      stopReason: 'llm_api_error',
+      isApprovalError: false,
+    });
+
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+    });
+
+    await expect(bot.sendToAgent('trigger error')).rejects.toThrow(
+      'INTERNAL_SERVER_ERROR: Bad request to Anthropic: Error code: 400'
+    );
+    expect(getLatestRunError).toHaveBeenCalledWith('agent-contract-test', 'conv-123');
+  });
+
+  it('falls back to msg.error when no enrichment is available', async () => {
+    const mockSession = {
+      initialize: vi.fn(async () => undefined),
+      send: vi.fn(async (_message: unknown) => undefined),
+      stream: vi.fn(() =>
+        (async function* () {
+          yield { type: 'result', success: false, error: 'timeout' };
+        })()
+      ),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-contract-test',
+      conversationId: 'conversation-contract-test',
+    };
+
+    vi.mocked(resumeSession).mockReturnValue(mockSession as never);
+    vi.mocked(getLatestRunError).mockResolvedValueOnce(null);
+
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+    });
+
+    await expect(bot.sendToAgent('trigger error')).rejects.toThrow(
+      'Agent run failed: timeout'
+    );
+  });
+
+  it('passes tags: [origin:lettabot] to createAgent when creating a new agent', async () => {
+    delete process.env.LETTA_AGENT_ID;
+
+    vi.mocked(createAgent).mockResolvedValue('agent-new-tagged');
+
+    const mockSession = {
+      initialize: vi.fn(async () => undefined),
+      send: vi.fn(async (_message: unknown) => undefined),
+      stream: vi.fn(() =>
+        (async function* () {
+          yield { type: 'assistant', content: 'hello' };
+          yield { type: 'result', success: true };
+        })()
+      ),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-new-tagged',
+      conversationId: 'conversation-new-tagged',
+    };
+
+    vi.mocked(createSession).mockReturnValue(mockSession as never);
+
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+    });
+
+    await bot.sendToAgent('first message');
+
+    expect(vi.mocked(createAgent)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(createAgent)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tags: ['origin:lettabot'],
+      })
+    );
+  });
+
+  it('retries sendToAgent when SDK result runIds repeat the previous run', async () => {
+    let streamCall = 0;
+
+    const mockSession = {
+      initialize: vi.fn(async () => undefined),
+      send: vi.fn(async () => undefined),
+      stream: vi.fn(() => {
+        const call = streamCall++;
+        return (async function* () {
+          if (call === 0) {
+            yield { type: 'assistant', content: 'response-A' };
+            yield { type: 'result', success: true, runIds: ['run-A'] };
+            return;
+          }
+          if (call === 1) {
+            // Stale replay of the previous run; bot should retry once.
+            yield { type: 'assistant', content: 'stale-A' };
+            yield { type: 'result', success: true, runIds: ['run-A'] };
+            return;
+          }
+          yield { type: 'assistant', content: 'response-B' };
+          yield { type: 'result', success: true, runIds: ['run-B'] };
+        })();
+      }),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-runid-test',
+      conversationId: 'conversation-runid-test',
+    };
+
+    vi.mocked(createSession).mockReturnValue(mockSession as never);
+    vi.mocked(resumeSession).mockReturnValue(mockSession as never);
+
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+    });
+
+    const responseA = await bot.sendToAgent('first message');
+    expect(responseA).toBe('response-A');
+
+    const responseB = await bot.sendToAgent('second message');
+    expect(responseB).toBe('response-B');
+
+    expect(mockSession.send).toHaveBeenCalledTimes(3);
+    expect(mockSession.send).toHaveBeenNthCalledWith(1, 'first message');
+    expect(mockSession.send).toHaveBeenNthCalledWith(2, 'second message');
+    expect(mockSession.send).toHaveBeenNthCalledWith(3, 'second message');
+    expect(mockSession.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('invalidates background sessions when reuseSession is false', async () => {
+    const mockSession = {
+      initialize: vi.fn(async () => undefined),
+      send: vi.fn(async () => undefined),
+      stream: vi.fn(() =>
+        (async function* () {
+          yield { type: 'assistant', content: 'ok' };
+          // Keep this fixture aligned with current SDK output where runIds is
+          // often absent; this test validates reuseSession behavior only.
+          yield { type: 'result', success: true };
+        })()
+      ),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-reuse-false',
+      conversationId: 'conversation-reuse-false',
+    };
+
+    vi.mocked(createSession).mockReturnValue(mockSession as never);
+    vi.mocked(resumeSession).mockReturnValue(mockSession as never);
+
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+      reuseSession: false,
+    });
+
+    await bot.sendToAgent('first background trigger');
+    await bot.sendToAgent('second background trigger');
+
+    expect(mockSession.close).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not leak stale stream events between consecutive sendToAgent calls', async () => {
+    // Simulates the real SDK behavior prior to 0.1.8: the shared streamQueue
+    // retains events that arrive after the result message. When the next
+    // stream() call starts, it reads these stale events first, causing the
+    // N-1 desync and silent-mode heartbeat leak.
+    const sharedQueue: Array<{ type: string; content?: string; success?: boolean }> = [];
+    let sendCount = 0;
+
+    const mockSession = {
+      initialize: vi.fn(async () => undefined),
+      send: vi.fn(async () => {
+        // SDK 0.1.8 fix: clear stale events from previous run on every send().
+        // Without this line, stale events from run A leak into run B's stream.
+        sharedQueue.length = 0;
+
+        if (sendCount === 0) {
+          // First run: response A, result, then trailing stale events that
+          // arrive in the background pump AFTER the result has been yielded.
+          sharedQueue.push(
+            { type: 'assistant', content: 'response-A' },
+            { type: 'result', success: true },
+            // Stale event that would leak into next stream() without the fix:
+            { type: 'assistant', content: 'stale-heartbeat-text' },
+          );
+        } else {
+          // Second run: response B
+          sharedQueue.push(
+            { type: 'assistant', content: 'response-B' },
+            { type: 'result', success: true },
+          );
+        }
+        sendCount++;
+      }),
+      stream: vi.fn(() =>
+        (async function* () {
+          while (sharedQueue.length > 0) {
+            const msg = sharedQueue.shift()!;
+            yield msg;
+            if (msg.type === 'result') break;
+          }
+        })()
+      ),
+      close: vi.fn(() => undefined),
+      agentId: 'agent-queue-leak-test',
+      conversationId: 'conversation-queue-leak-test',
+    };
+
+    vi.mocked(createSession).mockReturnValue(mockSession as never);
+    vi.mocked(resumeSession).mockReturnValue(mockSession as never);
+
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+    });
+
+    const responseA = await bot.sendToAgent('first message');
+    expect(responseA).toBe('response-A');
+
+    const responseB = await bot.sendToAgent('second message');
+    // Before the SDK 0.1.8 fix, responseB would be 'stale-heartbeat-text'
+    // because the sharedQueue still had the trailing event from run A.
+    // With the fix (queue cleared on send), responseB is 'response-B'.
+    expect(responseB).toBe('response-B');
   });
 });

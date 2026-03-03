@@ -4,13 +4,15 @@
 
 import { existsSync, readdirSync, readFileSync, mkdirSync, cpSync } from 'node:fs';
 import { execSync } from 'node:child_process';
-import { join, resolve } from 'node:path';
+import { join, resolve, delimiter } from 'node:path';
 import matter from 'gray-matter';
 import type { SkillEntry, ClawdbotMetadata } from './types.js';
 
 // Skills directories (in priority order: project > agent > global > bundled > skills.sh)
 const HOME = process.env.HOME || process.env.USERPROFILE || '';
+export const WORKING_DIR = process.env.WORKING_DIR || '/tmp/lettabot';
 export const PROJECT_SKILLS_DIR = resolve(process.cwd(), '.skills');
+export const WORKING_SKILLS_DIR = join(WORKING_DIR, '.skills'); // skills enabled via CLI
 export const GLOBAL_SKILLS_DIR = join(HOME, '.letta', 'skills');
 export const SKILLS_SH_DIR = join(HOME, '.agents', 'skills'); // skills.sh global installs
 
@@ -28,6 +30,98 @@ export const BUNDLED_SKILLS_DIR = resolve(__dirname, '../../skills'); // lettabo
  */
 export function getAgentSkillsDir(agentId: string): string {
   return join(HOME, '.letta', 'agents', agentId, 'skills');
+}
+
+/**
+ * Resolve subdirectories that contain executable skill files.
+ */
+function resolveSkillExecutableDirs(skillsDir: string): string[] {
+  // Only add dirs that contain at least one executable (non-.md) file
+  return readdirSync(skillsDir, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .map(d => join(skillsDir, d.name))
+    .filter(dir => {
+      try {
+        return readdirSync(dir).some(f => !f.endsWith('.md'));
+      } catch { return false; }
+    });
+}
+
+/**
+ * Get executable skill directories for a specific agent.
+ */
+export function getAgentSkillExecutableDirs(agentId: string): string[] {
+  const skillsDir = getAgentSkillsDir(agentId);
+  if (!existsSync(skillsDir)) return [];
+  return resolveSkillExecutableDirs(skillsDir);
+}
+
+/**
+ * Get executable skill directories from the working-dir .skills/ folder.
+ * These are skills enabled via `lettabot skills enable` or the sync wizard.
+ */
+export function getWorkingSkillExecutableDirs(): string[] {
+  if (!existsSync(WORKING_SKILLS_DIR)) return [];
+  return resolveSkillExecutableDirs(WORKING_SKILLS_DIR);
+}
+
+/**
+ * Permanently prepend skill directories to PATH so that subprocesses
+ * spawned subsequently inherit them.
+ *
+ * Includes both agent-scoped skills (~/.letta/agents/{id}/skills/) and
+ * working-dir skills (WORKING_DIR/.skills/) so that skills enabled via
+ * `lettabot skills enable` are available without needing a feature-gate.
+ *
+ * This must be called BEFORE createSession/resumeSession -- the SDK spawns
+ * the subprocess at session-creation time, not during initialize(). The
+ * subprocess inherits its environment at fork; calling this afterward has
+ * no effect on an already-running process.
+ *
+ * Unlike withAgentSkillsOnPath this does not restore the original PATH.
+ * The prepend is idempotent: dirs already present are not added twice.
+ */
+export function prependSkillDirsToPath(agentId: string): void {
+  const agentDirs = getAgentSkillExecutableDirs(agentId);
+  const workingDirs = getWorkingSkillExecutableDirs();
+  const seen = new Set(agentDirs);
+  const dirs = [...agentDirs, ...workingDirs.filter(d => !seen.has(d))];
+
+  if (dirs.length === 0) return;
+
+  const originalPath = process.env.PATH || '';
+  const existing = new Set(originalPath.split(delimiter).filter(Boolean));
+  const prepend = dirs.filter(d => !existing.has(d));
+
+  if (prepend.length > 0) {
+    process.env.PATH = [...prepend, originalPath].filter(Boolean).join(delimiter);
+    log.info(`Prepended ${prepend.length} skill dir(s) to PATH: ${prepend.join(', ')}`);
+  }
+}
+
+/**
+ * @deprecated Use prependSkillDirsToPath() before session creation instead.
+ * This wrapper restores PATH after the callback, but the SDK spawns the
+ * subprocess during createSession/resumeSession -- before initialize() is
+ * called -- so PATH changes here don't reach the subprocess.
+ */
+export async function withAgentSkillsOnPath<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
+  prependSkillDirsToPath(agentId);
+  return fn();
+}
+
+/**
+ * Whether TTS credentials are configured enough to use voice-memo skill.
+ */
+export function isVoiceMemoConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  const provider = (env.TTS_PROVIDER || 'elevenlabs').toLowerCase();
+  if (provider === 'openai') {
+    return !!env.OPENAI_API_KEY;
+  }
+  if (provider === 'elevenlabs') {
+    return !!env.ELEVENLABS_API_KEY;
+  }
+  return false;
 }
 
 /**
@@ -158,7 +252,10 @@ export function loadAllSkills(agentId?: string | null): SkillEntry[] {
   // skills.sh global installs (lowest priority)
   dirs.push(SKILLS_SH_DIR);
   
-  // Global skills
+  // Bundled skills (ship with the project in skills/)
+  dirs.push(BUNDLED_SKILLS_DIR);
+
+  // Global skills (override bundled defaults)
   dirs.push(GLOBAL_SKILLS_DIR);
   
   // Agent-scoped skills (middle priority)
@@ -208,6 +305,7 @@ function installSkillsFromDir(sourceDir: string, targetDir: string): string[] {
 export const FEATURE_SKILLS: Record<string, string[]> = {
   cron: ['scheduling'],      // Scheduling handles both one-off reminders and recurring cron jobs
   google: ['gog', 'google'], // Installed when Google/Gmail is configured
+  tts: ['voice-memo'],       // Voice memo replies via lettabot-tts helper
 };
 
 /**
@@ -242,6 +340,7 @@ function installSpecificSkills(
 export interface SkillsInstallConfig {
   cronEnabled?: boolean;
   googleEnabled?: boolean;  // Gmail polling or Google integration
+  ttsEnabled?: boolean;     // Voice memo replies via TTS providers
   additionalSkills?: string[]; // Explicitly enabled skills
 }
 
@@ -261,22 +360,29 @@ export function installSkillsToWorkingDir(workingDir: string, config: SkillsInst
   mkdirSync(targetDir, { recursive: true });
   
   // Collect skills to install based on enabled features
-  const skillsToInstall: string[] = [];
+  const requestedSkills: string[] = [];
   
   // Cron skills (always if cron is enabled)
   if (config.cronEnabled) {
-    skillsToInstall.push(...FEATURE_SKILLS.cron);
+    requestedSkills.push(...FEATURE_SKILLS.cron);
   }
   
   // Google skills (if Gmail polling or Google is configured)
   if (config.googleEnabled) {
-    skillsToInstall.push(...FEATURE_SKILLS.google);
+    requestedSkills.push(...FEATURE_SKILLS.google);
+  }
+
+  // Voice memo skill (if TTS is configured)
+  if (config.ttsEnabled) {
+    requestedSkills.push(...FEATURE_SKILLS.tts);
   }
   
   // Additional explicitly enabled skills
   if (config.additionalSkills?.length) {
-    skillsToInstall.push(...config.additionalSkills);
+    requestedSkills.push(...config.additionalSkills);
   }
+
+  const skillsToInstall = Array.from(new Set(requestedSkills));
   
   if (skillsToInstall.length === 0) {
     log.info('No feature-gated skills to install');
@@ -310,22 +416,29 @@ export function installSkillsToAgent(agentId: string, config: SkillsInstallConfi
   mkdirSync(targetDir, { recursive: true });
   
   // Collect skills to install based on enabled features
-  const skillsToInstall: string[] = [];
+  const requestedSkills: string[] = [];
   
   // Cron skills (always if cron is enabled)
   if (config.cronEnabled) {
-    skillsToInstall.push(...FEATURE_SKILLS.cron);
+    requestedSkills.push(...FEATURE_SKILLS.cron);
   }
   
   // Google skills (if Gmail polling or Google is configured)
   if (config.googleEnabled) {
-    skillsToInstall.push(...FEATURE_SKILLS.google);
+    requestedSkills.push(...FEATURE_SKILLS.google);
+  }
+
+  // Voice memo skill (if TTS is configured)
+  if (config.ttsEnabled) {
+    requestedSkills.push(...FEATURE_SKILLS.tts);
   }
   
   // Additional explicitly enabled skills
   if (config.additionalSkills?.length) {
-    skillsToInstall.push(...config.additionalSkills);
+    requestedSkills.push(...config.additionalSkills);
   }
+
+  const skillsToInstall = Array.from(new Set(requestedSkills));
   
   if (skillsToInstall.length === 0) {
     return; // No skills to install - silent return

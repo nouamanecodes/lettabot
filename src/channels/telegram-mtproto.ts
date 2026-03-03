@@ -78,7 +78,7 @@ export class TelegramMTProtoAdapter implements ChannelAdapter {
   private pendingPairingApprovals = new Map<number, { code: string; userId: string; username: string }>();
 
   onMessage?: (msg: InboundMessage) => Promise<void>;
-  onCommand?: (command: string) => Promise<string | null>;
+  onCommand?: (command: string, chatId?: string, args?: string) => Promise<string | null>;
 
   constructor(config: TelegramMTProtoConfig) {
     this.config = {
@@ -496,6 +496,7 @@ Reply **approve** or **deny** to this message.`;
       text,
       messageId,
       timestamp: new Date(message.date * 1000),
+      formatterHints: this.getFormatterHints(),
     };
 
     // Call handler
@@ -747,6 +748,14 @@ Reply **approve** or **deny** to this message.`;
     // updateMessageSendSucceeded provides the real ID.
     // TODO: Implement message ID tracking to enable streaming edits
     return false;
+  }
+
+  getFormatterHints() {
+    return {
+      supportsReactions: false,
+      supportsFiles: false,
+      formatHint: 'MarkdownV2: *bold* _italic_ `code` [link](url) — NO: headers, tables',
+    };
   }
 
   async sendMessage(msg: OutboundMessage): Promise<{ messageId: string }> {

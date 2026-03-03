@@ -28,7 +28,12 @@ describe('isFleetConfig', () => {
     expect(
       isFleetConfig({
         agents: [
-          { name: 'bot', llm_config: { model: 'gpt-4' }, system_prompt: { value: 'hi' } },
+          {
+            name: 'bot',
+            llm_config: { model: 'gpt-4' },
+            system_prompt: { value: 'hi' },
+            lettabot: { channels: {} },
+          },
         ],
       }),
     ).toBe(true);
@@ -37,7 +42,7 @@ describe('isFleetConfig', () => {
   it('returns true for a fleet config with system_prompt only', () => {
     expect(
       isFleetConfig({
-        agents: [{ name: 'bot', system_prompt: { value: 'hi' } }],
+        agents: [{ name: 'bot', system_prompt: { value: 'hi' }, lettabot: { channels: {} } }],
       }),
     ).toBe(true);
   });
@@ -59,6 +64,22 @@ describe('isFleetConfig', () => {
         agents: [
           { name: 'Bot1', channels: { telegram: { enabled: true } } },
         ],
+      }),
+    ).toBe(false);
+  });
+
+  it('returns false when fleet-only fields exist but lettabot section is missing', () => {
+    expect(
+      isFleetConfig({
+        agents: [{ name: 'bot', llm_config: { model: 'gpt-4' }, system_prompt: { value: 'hi' } }],
+      }),
+    ).toBe(false);
+  });
+
+  it('returns false when lettabot is an array', () => {
+    expect(
+      isFleetConfig({
+        agents: [{ name: 'bot', llm_config: { model: 'gpt-4' }, lettabot: [] }],
       }),
     ).toBe(false);
   });
@@ -144,6 +165,9 @@ describe('fleetConfigToLettaBotConfig (single agent)', () => {
             polling: { gmail: { enabled: true, account: 'user@gmail.com' } },
             transcription: { provider: 'openai', apiKey: 'sk-oai' },
             attachments: { maxMB: 10, maxAgeDays: 7 },
+            tts: { provider: 'openai', apiKey: 'sk-openai-tts', voiceId: 'alloy', model: 'gpt-4o-mini-tts' },
+            integrations: { google: { enabled: true, account: 'user@gmail.com' } },
+            security: { redaction: { secrets: true, pii: true } },
           },
         },
       ],
@@ -164,6 +188,9 @@ describe('fleetConfigToLettaBotConfig (single agent)', () => {
     expect(result.polling?.gmail?.account).toBe('user@gmail.com');
     expect(result.transcription?.provider).toBe('openai');
     expect(result.attachments?.maxMB).toBe(10);
+    expect(result.tts?.provider).toBe('openai');
+    expect(result.integrations?.google?.enabled).toBe(true);
+    expect(result.security?.redaction?.secrets).toBe(true);
   });
 
   it('skips agents without lettabot section', () => {
@@ -190,6 +217,31 @@ describe('fleetConfigToLettaBotConfig (single agent)', () => {
     expect(result.channels.telegram?.token).toBe('tg');
     // Should be single-agent format (not multi-agent) since only one qualifies
     expect(result.agents).toBeUndefined();
+  });
+
+  it('throws when an agent with lettabot section is missing name', () => {
+    const fleet = {
+      agents: [
+        {
+          llm_config: { model: 'gpt-4' },
+          lettabot: { channels: {} },
+        },
+      ],
+    };
+
+    expect(() => fleetConfigToLettaBotConfig(fleet as any)).toThrow(/missing required `name`/);
+  });
+
+  it('ignores agents with array-typed lettabot section', () => {
+    const fleet = {
+      agents: [
+        { name: 'Bad', llm_config: { model: 'gpt-4' }, lettabot: [] },
+        { name: 'Good', llm_config: { model: 'gpt-4' }, lettabot: { channels: {} } },
+      ],
+    };
+
+    const result = fleetConfigToLettaBotConfig(fleet as any);
+    expect(result.agent.name).toBe('Good');
   });
 
   it('throws when no agents have lettabot section', () => {
@@ -241,6 +293,9 @@ describe('fleetConfigToLettaBotConfig (multi-agent)', () => {
             providers: [{ id: 'oai', name: 'openai', type: 'openai', apiKey: 'sk-1' }],
             transcription: { provider: 'openai' },
             attachments: { maxMB: 5 },
+            tts: { provider: 'openai' },
+            integrations: { google: { enabled: true, account: 'multi@gmail.com' } },
+            security: { redaction: { secrets: true } },
           },
         },
         {
@@ -266,6 +321,7 @@ describe('fleetConfigToLettaBotConfig (multi-agent)', () => {
     expect(result.agents![1].displayName).toBe('Second');
     expect(result.agents![1].channels.slack?.appToken).toBe('xapp');
     expect(result.agents![1].features?.cron).toBe(true);
+    expect(result.agents![0].security?.redaction?.secrets).toBe(true);
 
     // System-wide fields promoted from first agent
     expect(result.server.mode).toBe('docker');
@@ -273,6 +329,9 @@ describe('fleetConfigToLettaBotConfig (multi-agent)', () => {
     expect(result.providers).toHaveLength(1);
     expect(result.transcription?.provider).toBe('openai');
     expect(result.attachments?.maxMB).toBe(5);
+    expect(result.tts?.provider).toBe('openai');
+    expect(result.integrations?.google?.enabled).toBe(true);
+    expect(result.agent.name).toBe('LettaBot');
   });
 });
 

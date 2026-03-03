@@ -19,19 +19,22 @@ import {
   applyConfigToEnv,
   syncProviders,
   resolveConfigPath,
+  configSourceLabel,
+  hasInlineConfig,
   isDockerServerMode,
   serverModeLabel,
   wasLoadedFromFleetConfig,
 } from './config/index.js';
 import { isLettaApiUrl } from './utils/server.js';
-import { getDataDir, getWorkingDir, hasRailwayVolume } from './utils/paths.js';
+import { getCronDataDir, getDataDir, getWorkingDir, hasRailwayVolume, resolveWorkingDirPath } from './utils/paths.js';
+import { parseCsvList, parseNonNegativeNumber } from './utils/parse.js';
+import { sleep } from './utils/time.js';
 import { createLogger, setLogLevel } from './logger.js';
 
 const log = createLogger('Config');
 
 const yamlConfig = loadAppConfigOrExit();
-const configSource = existsSync(resolveConfigPath()) ? resolveConfigPath() : 'defaults + environment variables';
-log.info(`Loaded from ${configSource}`);
+log.info(`Loaded from ${configSourceLabel()}`);
 if (yamlConfig.agents?.length) {
   log.info(`Mode: ${serverModeLabel(yamlConfig.server.mode)}, Agents: ${yamlConfig.agents.map(a => a.name).join(', ')}`);
 } else {
@@ -177,24 +180,27 @@ import { CronService } from './cron/service.js';
 import { HeartbeatService } from './cron/heartbeat.js';
 import { PollingService, parseGmailAccounts } from './polling/service.js';
 import { agentExists, findAgentByName, ensureNoToolApprovals } from './tools/letta-api.js';
+import { isVoiceMemoConfigured } from './skills/loader.js';
 // Skills are now installed to agent-scoped location after agent creation (see bot.ts)
 
-// Check if config exists (skip in Railway/Docker where env vars are used directly)
+// Check if config exists (skip when inline config, container deploy, or env vars are used)
 const configPath = resolveConfigPath();
 const isContainerDeploy = !!(process.env.RAILWAY_ENVIRONMENT || process.env.RENDER || process.env.FLY_APP_NAME || process.env.DOCKER_DEPLOY);
-if (!existsSync(configPath) && !isContainerDeploy) {
+if (!existsSync(configPath) && !isContainerDeploy && !hasInlineConfig()) {
   log.info(`
 No config file found. Searched locations:
-  1. LETTABOT_CONFIG env var (not set)
-  2. ./lettabot.yaml (project-local - recommended)
-  3. ./lettabot.yml
-  4. ./agents.yml (fleet config from lettactl)
-  5. ./agents.yaml
-  6. ~/.lettabot/config.yaml (user global)
-  7. ~/.lettabot/config.yml
+  1. LETTABOT_CONFIG_YAML env var (inline YAML or base64 - recommended for cloud)
+  2. LETTABOT_CONFIG env var (file path)
+  3. ./lettabot.yaml (project-local - recommended for local dev)
+  4. ./lettabot.yml
+  5. ./agents.yml (fleet config from lettactl)
+  6. ./agents.yaml
+  7. ~/.lettabot/config.yaml (user global)
+  8. ~/.lettabot/config.yml
 
-Run "lettabot onboard" to create a config, or set LETTABOT_CONFIG=/path/to/config.yaml
-Or use an agents.yml from lettactl with a lettabot: section on your agent.
+Run "lettabot onboard" to create a config, set LETTABOT_CONFIG_YAML for cloud deploys,
+or use an agents.yml from lettactl with a lettabot: section.
+Encode your config: base64 < lettabot.yaml | tr -d '\\n'
 `);
   process.exit(1);
 }
@@ -213,10 +219,6 @@ const ATTACHMENTS_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const DISCOVERY_LOCK_TIMEOUT_MS = 15_000;
 const DISCOVERY_LOCK_STALE_MS = 60_000;
 const DISCOVERY_LOCK_RETRY_MS = 100;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 function getDiscoveryLockPath(agentName: string): string {
   const safe = agentName
@@ -367,6 +369,7 @@ function createChannelsForAgent(
       allowedUsers: agentConfig.channels.telegram!.allowedUsers && agentConfig.channels.telegram!.allowedUsers.length > 0
         ? agentConfig.channels.telegram!.allowedUsers.map(u => typeof u === 'string' ? parseInt(u, 10) : u)
         : undefined,
+      streaming: agentConfig.channels.telegram!.streaming,
       attachmentsDir,
       attachmentsMaxBytes,
       groups: agentConfig.channels.telegram!.groups,
@@ -398,6 +401,7 @@ function createChannelsForAgent(
       allowedUsers: agentConfig.channels.slack.allowedUsers && agentConfig.channels.slack.allowedUsers.length > 0
         ? agentConfig.channels.slack.allowedUsers
         : undefined,
+      streaming: agentConfig.channels.slack.streaming,
       attachmentsDir,
       attachmentsMaxBytes,
       groups: agentConfig.channels.slack.groups,
@@ -454,6 +458,7 @@ function createChannelsForAgent(
       allowedUsers: agentConfig.channels.discord.allowedUsers && agentConfig.channels.discord.allowedUsers.length > 0
         ? agentConfig.channels.discord.allowedUsers
         : undefined,
+      streaming: agentConfig.channels.discord.streaming,
       attachmentsDir,
       attachmentsMaxBytes,
       groups: agentConfig.channels.discord.groups,
@@ -488,20 +493,6 @@ function createGroupBatcher(
 
 // Skills are installed to agent-scoped directory when agent is created (see core/bot.ts)
 
-function parseCsvList(raw: string): string[] {
-  return raw
-    .split(',')
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
-}
-
-function parseNonNegativeNumber(raw: string | undefined): number | undefined {
-  if (!raw) return undefined;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
-  return parsed;
-}
-
 function ensureRequiredTools(tools: string[]): string[] {
   const out = [...tools];
   if (!out.includes('manage_todo')) {
@@ -513,12 +504,13 @@ function ensureRequiredTools(tools: string[]): string[] {
 // Global config (shared across all agents)
 const globalConfig = {
   workingDir: getWorkingDir(),
-  allowedTools: ensureRequiredTools(parseCsvList(
-    process.env.ALLOWED_TOOLS || 'Bash,Read,Edit,Write,Glob,Grep,Task,web_search,conversation_search',
-  )),
-  disallowedTools: parseCsvList(
-    process.env.DISALLOWED_TOOLS || 'EnterPlanMode,ExitPlanMode',
+  allowedTools: ensureRequiredTools(
+    yamlConfig.features?.allowedTools ??
+    parseCsvList(process.env.ALLOWED_TOOLS || 'Bash,Read,Edit,Write,Glob,Grep,Task,web_search,conversation_search'),
   ),
+  disallowedTools:
+    yamlConfig.features?.disallowedTools ??
+    parseCsvList(process.env.DISALLOWED_TOOLS || 'EnterPlanMode,ExitPlanMode'),
   attachmentsMaxBytes: resolveAttachmentsMaxBytes(),
   attachmentsMaxAgeDays: resolveAttachmentsMaxAgeDays(),
   cronEnabled: process.env.CRON_ENABLED === 'true',  // Legacy env var fallback
@@ -543,6 +535,7 @@ async function main() {
   }
   log.info(`Data directory: ${dataDir}`);
   log.info(`Working directory: ${globalConfig.workingDir}`);
+  process.env.LETTABOT_WORKING_DIR = globalConfig.workingDir;
   
   // Normalize config to agents array
   const agents = normalizeAgents(yamlConfig);
@@ -571,6 +564,7 @@ async function main() {
   }
   
   const gateway = new LettaGateway();
+  const voiceMemoEnabled = isVoiceMemoConfigured();
   const services: { 
     cronServices: CronService[], 
     heartbeatServices: HeartbeatService[], 
@@ -592,11 +586,22 @@ async function main() {
     const resolvedMemfs = agentConfig.features?.memfs ?? (process.env.LETTABOT_MEMFS === 'true' ? true : false);
 
     // Create LettaBot for this agent
+    const resolvedWorkingDir = agentConfig.workingDir
+      ? resolveWorkingDirPath(agentConfig.workingDir)
+      : globalConfig.workingDir;
+    // Per-agent cron store path: in multi-agent mode, each agent gets its own file
+    const cronStoreFilename = agents.length > 1
+      ? `cron-jobs-${agentConfig.name}.json`
+      : undefined;
+    const cronStorePath = cronStoreFilename
+      ? resolve(getCronDataDir(), cronStoreFilename)
+      : undefined;
+
     const bot = new LettaBot({
-      workingDir: globalConfig.workingDir,
+      workingDir: resolvedWorkingDir,
       agentName: agentConfig.name,
-      allowedTools: globalConfig.allowedTools,
-      disallowedTools: globalConfig.disallowedTools,
+      allowedTools: ensureRequiredTools(agentConfig.features?.allowedTools ?? globalConfig.allowedTools),
+      disallowedTools: agentConfig.features?.disallowedTools ?? globalConfig.disallowedTools,
       displayName: agentConfig.displayName,
       maxToolCalls: agentConfig.features?.maxToolCalls,
       sendFileDir: agentConfig.features?.sendFileDir,
@@ -607,16 +612,21 @@ async function main() {
       conversationMode: agentConfig.conversations?.mode || 'shared',
       heartbeatConversation: agentConfig.conversations?.heartbeat || 'last-active',
       conversationOverrides: agentConfig.conversations?.perChannel,
+      maxSessions: agentConfig.conversations?.maxSessions,
+      reuseSession: agentConfig.conversations?.reuseSession,
+      redaction: agentConfig.security?.redaction,
+      cronStorePath,
       skills: {
         cronEnabled: agentConfig.features?.cron ?? globalConfig.cronEnabled,
         googleEnabled: !!agentConfig.integrations?.google?.enabled || !!agentConfig.polling?.gmail?.enabled,
+        ttsEnabled: voiceMemoEnabled,
       },
     });
     
     // Log memfs config (from either YAML or env var)
     if (resolvedMemfs !== undefined) {
       const source = agentConfig.features?.memfs !== undefined ? '' : ' (from LETTABOT_MEMFS env)';
-      console.log(`[Agent:${agentConfig.name}] memfs: ${resolvedMemfs ? 'enabled' : 'disabled'}${source}`);
+      log.info(`Agent ${agentConfig.name}: memfs ${resolvedMemfs ? 'enabled' : 'disabled'}${source}`);
     }
 
     // Apply explicit agent ID from config (before store verification)
@@ -637,9 +647,8 @@ async function main() {
       }
     }
 
-    // Discover agent by name under an inter-process lock to avoid startup races.
-    // Enabled for container deploys and when config was loaded from fleet format
-    // (agents.yml) where lettactl apply already created the agent on the server.
+    // Discover by name under an inter-process lock to avoid startup races.
+    // Fleet configs rely on pre-created agents from lettactl apply.
     if (!initialStatus.agentId && (isContainerDeploy || wasLoadedFromFleetConfig())) {
       try {
         await withDiscoveryLock(agentConfig.name, async () => {
@@ -691,7 +700,7 @@ async function main() {
 
     // Per-agent cron
     if (agentConfig.features?.cron ?? globalConfig.cronEnabled) {
-      const cronService = new CronService(bot);
+      const cronService = new CronService(bot, cronStoreFilename ? { storePath: cronStoreFilename } : undefined);
       await cronService.start();
       services.cronServices.push(cronService);
     }
@@ -700,12 +709,12 @@ async function main() {
     const heartbeatConfig = agentConfig.features?.heartbeat;
     const heartbeatService = new HeartbeatService(bot, {
       enabled: heartbeatConfig?.enabled ?? false,
-      intervalMinutes: heartbeatConfig?.intervalMin ?? 30,
+      intervalMinutes: heartbeatConfig?.intervalMin ?? 240,
       skipRecentUserMinutes: heartbeatConfig?.skipRecentUserMin ?? globalConfig.heartbeatSkipRecentUserMin,
       agentKey: agentConfig.name,
       prompt: heartbeatConfig?.prompt || process.env.HEARTBEAT_PROMPT,
       promptFile: heartbeatConfig?.promptFile,
-      workingDir: globalConfig.workingDir,
+      workingDir: resolvedWorkingDir,
       target: parseHeartbeatTarget(heartbeatConfig?.target) || parseHeartbeatTarget(process.env.HEARTBEAT_TARGET),
     });
     if (heartbeatConfig?.enabled) {
@@ -741,14 +750,19 @@ async function main() {
           ?? (agentConfig.integrations?.google?.pollIntervalSec
             ? agentConfig.integrations.google.pollIntervalSec * 1000
             : 60000),
-        gmail: { enabled: gmailEnabled, accounts: gmailAccounts },
+        gmail: {
+          enabled: gmailEnabled,
+          accounts: gmailAccounts,
+          prompt: agentConfig.polling?.gmail?.prompt,
+          promptFile: agentConfig.polling?.gmail?.promptFile,
+        },
       };
     })();
     
     if (pollConfig.enabled && pollConfig.gmail.enabled && pollConfig.gmail.accounts.length > 0) {
       const pollingService = new PollingService(bot, {
         intervalMs: pollConfig.intervalMs,
-        workingDir: globalConfig.workingDir,
+        workingDir: resolvedWorkingDir,
         gmail: pollConfig.gmail,
       });
       pollingService.start();
@@ -789,11 +803,13 @@ async function main() {
       channels: status.channels,
       features: {
         cron: cfg?.features?.cron ?? globalConfig.cronEnabled,
-        heartbeatIntervalMin: hbCfg?.enabled ? (hbCfg.intervalMin ?? 30) : undefined,
+        heartbeatIntervalMin: hbCfg?.enabled ? (hbCfg.intervalMin ?? 240) : undefined,
       },
     };
   });
-  printStartupBanner(bannerAgents);
+  if (!process.env.LETTABOT_NO_BANNER) {
+    printStartupBanner(bannerAgents);
+  }
   
   // Shutdown
   const shutdown = async () => {

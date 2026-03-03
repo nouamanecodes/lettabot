@@ -48,14 +48,18 @@ export function isFleetConfig(parsed: unknown): boolean {
     return false;
   }
 
-  // At least one entry must have a lettactl-only field
-  return agents.some(
-    (a: unknown) =>
-      !!a &&
-      typeof a === 'object' &&
-      ('llm_config' in (a as Record<string, unknown>) ||
-        'system_prompt' in (a as Record<string, unknown>)),
-  );
+  // At least one entry must look like a lettactl agent and include
+  // a lettabot runtime section so unrelated agents.yml files are ignored.
+  return agents.some((a: unknown) => {
+    if (!a || typeof a !== 'object' || Array.isArray(a)) {
+      return false;
+    }
+    const candidate = a as Record<string, unknown>;
+    const hasFleetOnlyFields = 'llm_config' in candidate || 'system_prompt' in candidate;
+    const lettabot = candidate.lettabot;
+    const hasLettaBotSection = !!lettabot && typeof lettabot === 'object' && !Array.isArray(lettabot);
+    return hasFleetOnlyFields && hasLettaBotSection;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -63,7 +67,7 @@ export function isFleetConfig(parsed: unknown): boolean {
 // ---------------------------------------------------------------------------
 
 interface FleetAgent {
-  name: string;
+  name?: string;
   description?: string;
   llm_config?: unknown;
   system_prompt?: unknown;
@@ -96,8 +100,22 @@ export function fleetConfigToLettaBotConfig(
 ): LettaBotConfig {
   const rawAgents = parsed.agents as FleetAgent[];
 
+  for (const agent of rawAgents) {
+    if (!agent || typeof agent !== 'object' || Array.isArray(agent)) {
+      continue;
+    }
+    if (!agent.lettabot) {
+      continue;
+    }
+    if (!agent.name || !agent.name.trim()) {
+      throw new Error(
+        'Fleet config agent is missing required `name`. Add `name` to each agent with a `lettabot:` section.',
+      );
+    }
+  }
+
   const qualifying = rawAgents.filter(
-    (a) => !!a.lettabot && typeof a.lettabot === 'object',
+    (a) => !!a.lettabot && typeof a.lettabot === 'object' && !Array.isArray(a.lettabot),
   );
 
   if (qualifying.length === 0) {
@@ -129,6 +147,9 @@ function extractLettabotFields(lb: Record<string, unknown>) {
     polling: lb.polling as LettaBotConfig['polling'],
     transcription: lb.transcription as LettaBotConfig['transcription'],
     attachments: lb.attachments as LettaBotConfig['attachments'],
+    tts: lb.tts as LettaBotConfig['tts'],
+    integrations: lb.integrations as LettaBotConfig['integrations'],
+    security: lb.security as LettaBotConfig['security'],
   };
 }
 
@@ -138,7 +159,7 @@ function buildSingleAgentConfig(agent: FleetAgent): LettaBotConfig {
   return {
     server: { mode: 'api', ...lb.server },
     agent: {
-      name: agent.name,
+      name: agent.name!,
       displayName: lb.displayName,
     },
     channels: lb.channels ?? {},
@@ -148,6 +169,9 @@ function buildSingleAgentConfig(agent: FleetAgent): LettaBotConfig {
     polling: lb.polling,
     transcription: lb.transcription,
     attachments: lb.attachments,
+    tts: lb.tts,
+    integrations: lb.integrations,
+    security: lb.security,
   };
 }
 
@@ -159,22 +183,25 @@ function buildMultiAgentConfig(agents: FleetAgent[]): LettaBotConfig {
   const nativeAgents: AgentConfig[] = agents.map((agent) => {
     const lb = extractLettabotFields(agent.lettabot!);
     return {
-      name: agent.name,
+      name: agent.name!,
       displayName: lb.displayName,
       channels: lb.channels ?? {},
       conversations: lb.conversations,
       features: lb.features,
       polling: lb.polling,
+      security: lb.security,
     };
   });
 
   return {
     server: { mode: 'api', ...firstLb.server },
-    agent: { name: nativeAgents[0].name },
+    agent: { name: 'LettaBot' },
     channels: {},
     agents: nativeAgents,
     providers: firstLb.providers,
     transcription: firstLb.transcription,
     attachments: firstLb.attachments,
+    tts: firstLb.tts,
+    integrations: firstLb.integrations,
   };
 }

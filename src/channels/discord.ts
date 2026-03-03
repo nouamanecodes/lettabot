@@ -26,6 +26,7 @@ export interface DiscordConfig {
   token: string;
   dmPolicy?: DmPolicy;      // 'pairing' (default), 'allowlist', or 'open'
   allowedUsers?: string[];  // Discord user IDs
+  streaming?: boolean;      // Stream responses via progressive message edits (default: false)
   attachmentsDir?: string;
   attachmentsMaxBytes?: number;
   groups?: Record<string, GroupModeConfig>;  // Per-guild/channel settings
@@ -56,7 +57,7 @@ export class DiscordAdapter implements ChannelAdapter {
   private attachmentsMaxBytes?: number;
 
   onMessage?: (msg: InboundMessage) => Promise<void>;
-  onCommand?: (command: string) => Promise<string | null>;
+  onCommand?: (command: string, chatId?: string, args?: string) => Promise<string | null>;
 
   constructor(config: DiscordConfig) {
     this.config = {
@@ -246,14 +247,16 @@ Ask the bot owner to approve with:
       if (!content && attachments.length === 0) return;
 
       if (content.startsWith('/')) {
-        const command = content.slice(1).split(/\s+/)[0]?.toLowerCase();
+        const parts = content.slice(1).split(/\s+/);
+        const command = parts[0]?.toLowerCase();
+        const cmdArgs = parts.slice(1).join(' ') || undefined;
         if (command === 'help' || command === 'start') {
           await message.channel.send(HELP_TEXT);
           return;
         }
         if (this.onCommand) {
-          if (command === 'status' || command === 'reset' || command === 'heartbeat') {
-            const result = await this.onCommand(command);
+          if (command === 'status' || command === 'reset' || command === 'heartbeat' || command === 'cancel' || command === 'model') {
+            const result = await this.onCommand(command, message.channel.id, cmdArgs);
             if (result) {
               await message.channel.send(result);
             }
@@ -309,6 +312,7 @@ Ask the bot owner to approve with:
           wasMentioned,
           isListeningMode,
           attachments,
+          formatterHints: this.getFormatterHints(),
         });
       }
     });
@@ -346,8 +350,14 @@ Ask the bot owner to approve with:
       throw new Error(`Discord channel not found or not text-based: ${msg.chatId}`);
     }
 
-    const result = await (channel as { send: (content: string) => Promise<{ id: string }> }).send(msg.text);
-    return { messageId: result.id };
+    const sendable = channel as { send: (content: string) => Promise<{ id: string }> };
+    const chunks = splitMessageText(msg.text);
+    let lastMessageId = '';
+    for (const chunk of chunks) {
+      const result = await sendable.send(chunk);
+      lastMessageId = result.id;
+    }
+    return { messageId: lastMessageId };
   }
 
   async sendFile(file: OutboundFile): Promise<{ messageId: string }> {
@@ -380,7 +390,12 @@ Ask the bot owner to approve with:
       log.warn('Cannot edit message not sent by bot');
       return;
     }
-    await message.edit(text);
+
+    // Discord edit limit is 2000 chars -- truncate if needed (edits can't split)
+    const truncated = text.length > DISCORD_MAX_LENGTH
+      ? text.slice(0, DISCORD_MAX_LENGTH - 1) + '\u2026'
+      : text;
+    await message.edit(truncated);
   }
 
   async addReaction(chatId: string, messageId: string, emoji: string): Promise<void> {
@@ -411,8 +426,16 @@ Ask the bot owner to approve with:
     return this.config.dmPolicy || 'pairing';
   }
 
+  getFormatterHints() {
+    return {
+      supportsReactions: true,
+      supportsFiles: true,
+      formatHint: 'Discord markdown: **bold** *italic* `code` [links](url) ```code blocks``` — supports headers',
+    };
+  }
+
   supportsEditing(): boolean {
-    return true;
+    return this.config.streaming ?? false;
   }
 
   private async handleReactionEvent(
@@ -474,6 +497,7 @@ Ask the bot owner to approve with:
         messageId: message.id,
         action,
       },
+      formatterHints: this.getFormatterHints(),
     }).catch((err) => {
       log.error('Error handling reaction:', err);
     });
@@ -544,6 +568,58 @@ function resolveDiscordEmoji(input: string): string {
     return DISCORD_EMOJI_ALIAS_TO_UNICODE[input];
   }
   return input;
+}
+
+// Discord message length limit
+const DISCORD_MAX_LENGTH = 2000;
+// Leave some headroom when choosing split points
+const DISCORD_SPLIT_THRESHOLD = 1900;
+
+/**
+ * Split text into chunks that fit within Discord's 2000-char limit.
+ * Splits at paragraph boundaries (double newlines), falling back to
+ * single newlines, then hard-splitting at the threshold.
+ */
+function splitMessageText(text: string): string[] {
+  if (text.length <= DISCORD_SPLIT_THRESHOLD) {
+    return [text];
+  }
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > DISCORD_SPLIT_THRESHOLD) {
+    let splitIdx = -1;
+
+    const searchRegion = remaining.slice(0, DISCORD_SPLIT_THRESHOLD);
+    // Try paragraph boundary (double newline)
+    const lastParagraph = searchRegion.lastIndexOf('\n\n');
+    if (lastParagraph > DISCORD_SPLIT_THRESHOLD * 0.3) {
+      splitIdx = lastParagraph;
+    }
+
+    // Fall back to single newline
+    if (splitIdx === -1) {
+      const lastNewline = searchRegion.lastIndexOf('\n');
+      if (lastNewline > DISCORD_SPLIT_THRESHOLD * 0.3) {
+        splitIdx = lastNewline;
+      }
+    }
+
+    // Hard split as last resort
+    if (splitIdx === -1) {
+      splitIdx = DISCORD_SPLIT_THRESHOLD;
+    }
+
+    chunks.push(remaining.slice(0, splitIdx).trimEnd());
+    remaining = remaining.slice(splitIdx).trimStart();
+  }
+
+  if (remaining.trim()) {
+    chunks.push(remaining.trim());
+  }
+
+  return chunks;
 }
 
 type DiscordAttachment = {

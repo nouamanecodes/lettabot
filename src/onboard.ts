@@ -9,22 +9,17 @@ import * as p from '@clack/prompts';
 import { saveConfig, syncProviders, isApiServerMode } from './config/index.js';
 import type { AgentConfig, LettaBotConfig, ProviderConfig } from './config/types.js';
 import { isLettaApiUrl } from './utils/server.js';
+import { parseCsvList, parseOptionalInt } from './utils/parse.js';
 import { CHANNELS, getChannelHint, isSignalCliInstalled, setupTelegram, setupSlack, setupDiscord, setupWhatsApp, setupSignal } from './channels/setup.js';
 
 // ============================================================================
 // Non-Interactive Helpers
 // ============================================================================
 
-function parseCsvList(value?: string): string[] | undefined {
+function parseOptionalCsvList(value?: string): string[] | undefined {
   if (!value) return undefined;
-  const items = value.split(',').map(s => s.trim()).filter(Boolean);
+  const items = parseCsvList(value);
   return items.length > 0 ? items : undefined;
-}
-
-function parseOptionalInt(value?: string): number | undefined {
-  if (!value) return undefined;
-  const parsed = parseInt(value, 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function readConfigFromEnv(existingConfig: any): any {
@@ -43,9 +38,9 @@ function readConfigFromEnv(existingConfig: any): any {
         ?? existingConfig.channels?.telegram?.groupDebounceSec,
       groupPollIntervalMin: parseOptionalInt(process.env.TELEGRAM_GROUP_POLL_INTERVAL_MIN)
         ?? existingConfig.channels?.telegram?.groupPollIntervalMin,
-      instantGroups: parseCsvList(process.env.TELEGRAM_INSTANT_GROUPS)
+      instantGroups: parseOptionalCsvList(process.env.TELEGRAM_INSTANT_GROUPS)
         ?? existingConfig.channels?.telegram?.instantGroups,
-      listeningGroups: parseCsvList(process.env.TELEGRAM_LISTENING_GROUPS)
+      listeningGroups: parseOptionalCsvList(process.env.TELEGRAM_LISTENING_GROUPS)
         ?? existingConfig.channels?.telegram?.listeningGroups,
     },
     
@@ -59,9 +54,9 @@ function readConfigFromEnv(existingConfig: any): any {
         ?? existingConfig.channels?.slack?.groupDebounceSec,
       groupPollIntervalMin: parseOptionalInt(process.env.SLACK_GROUP_POLL_INTERVAL_MIN)
         ?? existingConfig.channels?.slack?.groupPollIntervalMin,
-      instantGroups: parseCsvList(process.env.SLACK_INSTANT_GROUPS)
+      instantGroups: parseOptionalCsvList(process.env.SLACK_INSTANT_GROUPS)
         ?? existingConfig.channels?.slack?.instantGroups,
-      listeningGroups: parseCsvList(process.env.SLACK_LISTENING_GROUPS)
+      listeningGroups: parseOptionalCsvList(process.env.SLACK_LISTENING_GROUPS)
         ?? existingConfig.channels?.slack?.listeningGroups,
     },
     
@@ -74,9 +69,9 @@ function readConfigFromEnv(existingConfig: any): any {
         ?? existingConfig.channels?.discord?.groupDebounceSec,
       groupPollIntervalMin: parseOptionalInt(process.env.DISCORD_GROUP_POLL_INTERVAL_MIN)
         ?? existingConfig.channels?.discord?.groupPollIntervalMin,
-      instantGroups: parseCsvList(process.env.DISCORD_INSTANT_GROUPS)
+      instantGroups: parseOptionalCsvList(process.env.DISCORD_INSTANT_GROUPS)
         ?? existingConfig.channels?.discord?.instantGroups,
-      listeningGroups: parseCsvList(process.env.DISCORD_LISTENING_GROUPS)
+      listeningGroups: parseOptionalCsvList(process.env.DISCORD_LISTENING_GROUPS)
         ?? existingConfig.channels?.discord?.listeningGroups,
     },
     
@@ -89,9 +84,9 @@ function readConfigFromEnv(existingConfig: any): any {
         ?? existingConfig.channels?.whatsapp?.groupDebounceSec,
       groupPollIntervalMin: parseOptionalInt(process.env.WHATSAPP_GROUP_POLL_INTERVAL_MIN)
         ?? existingConfig.channels?.whatsapp?.groupPollIntervalMin,
-      instantGroups: parseCsvList(process.env.WHATSAPP_INSTANT_GROUPS)
+      instantGroups: parseOptionalCsvList(process.env.WHATSAPP_INSTANT_GROUPS)
         ?? existingConfig.channels?.whatsapp?.instantGroups,
-      listeningGroups: parseCsvList(process.env.WHATSAPP_LISTENING_GROUPS)
+      listeningGroups: parseOptionalCsvList(process.env.WHATSAPP_LISTENING_GROUPS)
         ?? existingConfig.channels?.whatsapp?.listeningGroups,
     },
     
@@ -105,9 +100,9 @@ function readConfigFromEnv(existingConfig: any): any {
         ?? existingConfig.channels?.signal?.groupDebounceSec,
       groupPollIntervalMin: parseOptionalInt(process.env.SIGNAL_GROUP_POLL_INTERVAL_MIN)
         ?? existingConfig.channels?.signal?.groupPollIntervalMin,
-      instantGroups: parseCsvList(process.env.SIGNAL_INSTANT_GROUPS)
+      instantGroups: parseOptionalCsvList(process.env.SIGNAL_INSTANT_GROUPS)
         ?? existingConfig.channels?.signal?.instantGroups,
-      listeningGroups: parseCsvList(process.env.SIGNAL_LISTENING_GROUPS)
+      listeningGroups: parseOptionalCsvList(process.env.SIGNAL_LISTENING_GROUPS)
         ?? existingConfig.channels?.signal?.listeningGroups,
     },
   };
@@ -819,12 +814,18 @@ async function stepFeatures(config: OnboardConfig): Promise<void> {
   config.heartbeat.enabled = setupHeartbeat;
   
   if (setupHeartbeat) {
+    p.log.warn(
+      'Each heartbeat triggers a full agent invocation — real API cost, billed by your model.\n' +
+      'A 30-minute interval runs 48 invocations/day. A 4-hour interval runs 6.\n' +
+      'Most heartbeats are no-ops, but you pay for each one regardless.\n' +
+      'Set a longer interval if you\'re watching your spend.'
+    );
     const interval = await p.text({
       message: 'Interval (minutes)',
-      placeholder: '30',
-      initialValue: config.heartbeat.interval || '30',
+      placeholder: '240',
+      initialValue: config.heartbeat.interval || '240',
     });
-    if (!p.isCancel(interval)) config.heartbeat.interval = interval || '30';
+    if (!p.isCancel(interval)) config.heartbeat.interval = interval || '240';
   }
   
   // Cron
@@ -1533,7 +1534,7 @@ export async function onboard(options?: { nonInteractive?: boolean }): Promise<v
   if (config.agentChoice === 'new' && !config.agentId) {
     const { createAgent } = await import('@letta-ai/letta-code-sdk');
     const { updateAgentName, ensureNoToolApprovals } = await import('./tools/letta-api.js');
-    const { installSkillsToAgent } = await import('./skills/loader.js');
+    const { installSkillsToAgent, isVoiceMemoConfigured } = await import('./skills/loader.js');
     const { loadMemoryBlocks } = await import('./core/memory.js');
     const { SYSTEM_PROMPT } = await import('./core/system-prompt.js');
     
@@ -1543,6 +1544,7 @@ export async function onboard(options?: { nonInteractive?: boolean }): Promise<v
       const agentId = await createAgent({
         systemPrompt: SYSTEM_PROMPT,
         memory: loadMemoryBlocks(config.agentName || 'LettaBot'),
+        tags: ['origin:lettabot'],
         ...(config.model ? { model: config.model } : {}),
       });
       
@@ -1550,9 +1552,11 @@ export async function onboard(options?: { nonInteractive?: boolean }): Promise<v
       if (config.agentName) {
         await updateAgentName(agentId, config.agentName).catch(() => {});
       }
+      const ttsEnv = { ...process.env, ...env };
       installSkillsToAgent(agentId, {
         cronEnabled: config.cron,
         googleEnabled: config.google.enabled,
+        ttsEnabled: isVoiceMemoConfigured(ttsEnv),
       });
       
       // Disable tool approvals
